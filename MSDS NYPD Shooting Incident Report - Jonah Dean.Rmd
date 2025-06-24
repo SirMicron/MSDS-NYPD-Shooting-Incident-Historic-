@@ -1,0 +1,636 @@
+---
+title: "MSDS NYPD Shooting Incidents Investigation and Analysis"
+author: "J. Dean"
+date: "2025-06-20"
+output:
+  github_document: default
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(gridExtra)
+library(nnet)
+```
+
+This document will be a light investigation and analysis on the "NYPD Shooting Incidents Data (Historic)" dataset. The packages used are the `tidyverse`, `gridExtra`, and `nnet` packages. All steps of the data science process will be displayed, starting with importing and tidying the data.
+
+## Importing and Tidying the Data
+
+The data is a Non-Federal dataset from the [US Data Catalog.](https://catalog.data.gov/dataset/nypd-shooting-incident-data-historic) First we import the data.
+
+```{r get_data}
+nypd_data <- read_csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+nypd_data |> summary()
+```
+
+Then we tidy the data. The thought process behind our tidying decisions will be explained in the code below.
+
+```{r tidy_data}
+# Start by renaming the columns as desired. 
+# The 'date' variable will be made a 'date' type from the 'lubridate' package.
+
+nypd_data <- nypd_data |>   
+  rename("date" = OCCUR_DATE, "time" = OCCUR_TIME, "borough" = BORO, 
+         "loc_occ" = LOC_OF_OCCUR_DESC, "precinct" = PRECINCT, 
+         "jurisdiction" = JURISDICTION_CODE, "loc_class" = LOC_CLASSFCTN_DESC, 
+         "loc_desc" = LOCATION_DESC, "victim_death" = STATISTICAL_MURDER_FLAG, 
+         "perp_age" = PERP_AGE_GROUP, "perp_sex" = PERP_SEX, 
+         "perp_race" = PERP_RACE, "victim_age" = VIC_AGE_GROUP, 
+         "victim_sex" = VIC_SEX, "victim_race" = VIC_RACE) |>
+  mutate(date = mdy(date),                      
+         
+         # Unifying the missing or data points into one value, 
+         # which is chosen to be 'NA'. 
+         # The uncategorized data will be lumped in as well, so long as it does 
+         # not comprise a significant part of a variable's available data.
+         loc_class = ifelse(loc_class %in% c("(null)", "OTHER"), NA, loc_class), 
+         loc_desc = ifelse(loc_desc == "(null)", NA, loc_desc),         
+         perp_age = ifelse(perp_age %in% c("(null)", "1020", "1028", "2021", 
+                                           "224", "940"), NA, perp_age),
+         perp_sex = ifelse(perp_sex %in% c("(null)", "U"), NA, perp_sex),
+         perp_race = ifelse(perp_race == "(null)", NA, perp_race),
+         victim_age = ifelse(victim_age == "1022", NA, victim_age),
+         victim_sex = ifelse(victim_sex == "U", NA, victim_sex),
+         
+         # Setting the classification variables to factor types.
+         borough = as.factor(borough),    
+         loc_occ = as.factor(loc_occ),
+         loc_class = as.factor(loc_class),
+         loc_desc = as.factor(loc_desc),
+         precinct = as.factor(precinct),
+         jurisdiction = as.factor(jurisdiction),
+         perp_age = as.factor(perp_age),
+         perp_sex = as.factor(perp_sex),
+         perp_race = as.factor(perp_race),
+         victim_age = as.factor(victim_age),
+         victim_sex = as.factor(victim_sex),
+         victim_race = as.factor(victim_race)
+         ) |>
+  # Excluding the data we will not be analyzing in this document.
+  select(-c(INCIDENT_KEY, X_COORD_CD, Y_COORD_CD, Latitude, Longitude, Lon_Lat))  
+```
+
+```{r tidy_test, include=FALSE, eval=FALSE}
+# Testing chunk to evaluate the effectiveness of the tidying.
+nypd_data |>
+  count(perp_race)
+```
+
+Here is a quick summary of the data after tidying.
+
+```{r summary_after_tidy}
+summary(nypd_data)
+```
+
+As you might be able to tell, there is a lot of missing data in this dataset. Some entire variables are mainly composed of `NA` values, such as `loc_occ` which is composed of over 80% missing data. There is also data that is poorly entered, such as age ranges claiming a perpetrator was 1020 years old, although this can be assumed to have the intention to record an age range of 10-20 years. The poorly entered data is sparse, usually only having one data point, and representing roughly zero percent of the data. These single data point outliers will be removed from consideration in this document. The questions of what to do with the missing data and addressing bias will be handled on a case-specific basis.
+
+## Understanding the Data
+
+In order to understand the data, we must follow the cycle of `transform -> visualize -> model -> repeat`. I have already gone through the cycle, so I will just show the results. Let's first investigate whether the victim's age has any effect on the lethality of the shooting. Common sense dictates that the older the victim, the more lethal the shooting should be, but the data will show us. The following bar graph shows the `fatality` rate depending on the `victim_age`.
+
+```{r early_visuals1, fig.width = 10, fig.height = 6}
+nypd_data |> 
+  select(victim_age, victim_death)  |>
+  # Removing missing data, <0.3% of the whole. Causes minimal bias.
+  filter(is.na(victim_age) == FALSE) |>  
+  group_by(victim_age) |> 
+  summarize(fatality = sum(victim_death)/n()) |> #Calculating the fatality rate
+  
+  # Plotting the data.
+  ggplot(aes(x = victim_age, y = fatality)) +
+  geom_bar(stat = "identity") +
+  
+  # Themes, labels, and limits for the plot.
+  theme_bw() +
+  ylim(0, 0.4) + ylab("Fatality Rate") +
+  xlab("Age of Victim") +
+  ggtitle("Fatality Rate by Age of Victim")
+```
+
+As you can see, fatality rates follow a fairly linear trend: the older the victim, the more fatal the shooting. Due to time constraints we will not be creating and evaluating a linear model to this particular relation.
+
+## Race-on-Race shootings analysis
+
+The phrase "Black-on-Black Crime" is a heavily loaded phrase that we have the potential to partially investigate using this dataset. We will first create a graph that displays the race of the victim based on one particular race of shooters, ie. what is the racial demographic of victims of white shooters? We repeat this process for all applicable races of shooters. Then we use the `grid.arrange` function from the `gridExtra` package to display all of these graphs together, allowing for simpler comparison.
+
+```{r race_on_race1, fig.width = 10, fig.height = 8}
+# Making a tibble specific for this "Race-on-Race" comparison.
+race_on_race <- nypd_data |>
+  
+  # Eliminating all missing data here introduces bias that must be accounted for
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE) |>  
+  select(perp_race, victim_race) |>
+  
+  # This large `mutate` function is simply a relabeling of our categories to 
+  # make our graphs easier to understand later.
+  mutate(victim_race = ifelse(victim_race == "WHITE", "White",
+                       ifelse(victim_race == "WHITE HISPANIC", "White Hispanic",
+                       ifelse(victim_race == "BLACK", "Black",
+                       ifelse(victim_race == "BLACK HISPANIC", "Black Hispanic",
+                       ifelse(victim_race == "AMERICAN INDIAN/ALASKAN NATIVE", 
+                              "Native",
+                       ifelse(victim_race == "ASIAN / PACIFIC ISLANDER", "Asian", 
+                       ifelse(victim_race == "UNKNOWN", "Unknown", victim_race))))))))
+
+
+
+# Creating all the graphs and store them as variables.
+
+# White Shooters
+p_white <- race_on_race |>
+  filter(perp_race == "WHITE") |> 
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") + 
+  ggtitle("White Shooters")
+
+
+# White Hispanic Shooters
+p_white_hispanic <- race_on_race |>
+  filter(perp_race == "WHITE HISPANIC") |>
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") +
+  ggtitle("White Hispanic Shooters")
+
+
+# Black Shooters
+p_black <- race_on_race |>
+  filter(perp_race == "BLACK") |>
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") +
+  ggtitle("Black Shooters")
+
+
+# Native American Shooters
+p_native <- race_on_race |>
+  filter(perp_race == "AMERICAN INDIAN/ALASKAN NATIVE") |>
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") +
+  ggtitle("Native American Shooters")
+
+
+# Asian Shooters
+p_aapi <- race_on_race |>
+  filter(perp_race == "ASIAN / PACIFIC ISLANDER") |>
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") +
+  ggtitle("Asian Shooters")
+
+
+# Black Hispanic Shooters
+p_black_hispanic <- race_on_race |>
+  filter(perp_race == "BLACK HISPANIC") |>
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") +
+  ggtitle("Black Hispanic Shooters")
+
+# Shooters of unknown race
+p_unknown <- race_on_race |>
+  filter(perp_race == "UNKNOWN") |> 
+  group_by(victim_race) |>
+ggplot(aes(x=victim_race)) +
+  geom_bar() + theme_bw() +
+  ylab("Num. Shootings") + xlab("Race of Victim") + 
+  ggtitle("Unknown Race Shooters")
+
+
+# Putting all the graphs together using `grid.arrange` for an easier comparison.
+grid.arrange(p_white, p_white_hispanic, p_black, p_black_hispanic, p_aapi, 
+             p_native, p_unknown, ncol=2)
+```
+
+Several things must be taken into account when analyzing this visual. The first is the scale of the y-axis. The scale is orders of magnitude different depending on which graph you look at. These unequal scales are necessary to properly illustrate the proportions that are the key point of this comparison. The bias present in this plot will be addressed near the end of this document.
+
+The first thing that may stand out as potential for further investigation is that the majority of shootings are intraracial, ie. White shooters mainly shoot White people. However, in the case of Black Hispanic shooters, the majority of victims are Black people, followed by White Hispanic, and only then fellow Black Hispanic people. Another point of note is that Black victims make up a fairly sizable percentage of victims of all races of shooters. However, White shooters have shot slightly more White Hispanic people than Black people, and Native American people have been recorded as shooting people only two times in the 18 years this dataset covers. 
+
+This visualization brings plenty of questions and threads for further investigation. Unfortunately due to time constraints, we will be unable to explore most of these in this document.
+
+### Shooter's age Analysis
+
+We will only focus on one question for now. Since over 40% of the `perp_race` variable consists of missing values, can we use the victim's race to predict the race of the shooter? This question holds significant potential for stereotyping, bias, and racism, so we will not be tackling it in this document. I am not currently qualified to tackle this as a fledgling data scientist. However, we will focus on something similar: since over 30% of the shootings were carried out by shooters of unknown age, can we predict the shooter's age based on the age and race of each victim? While a slightly less effective question in terms of drawing meaningful conclusions, it is most certainly less potent and will do just well for our purposes.
+
+Since I am a fledgling data scientist, and due to time constraints, we will be using a logistic regression model to tackle this question. The variables we are working with are all categorical, and only two of which have natural ordering: the ages of the victim and perpetrator, whereas the victim's race and sex have no natural ordering. This means we will use a multinomial regression model, using the `multinom` function of the `nnet` package.
+
+First we transform the data into a useful form.
+
+```{r transform_data}
+age_pred_data <- nypd_data |>
+  
+  # Select the variables we want to use, and remove the missing data.
+  # This leaves us with 15,528 data points.  
+  select(perp_age, victim_race, victim_age) |>
+  filter(is.na(perp_age)==FALSE,
+         is.na(victim_race)==FALSE,
+         is.na(victim_age)==FALSE) |>
+  
+  # This large `mutate` function is simply a relabeling of our categories to 
+  # make our analysis and graphs easier to understand later.
+  mutate(victim_age = ifelse(victim_age == "UNKNOWN", "Unknown", victim_age),
+         perp_age = ifelse(perp_age == "UNKNOWN", "Unknown", perp_age),
+         victim_race = ifelse(victim_race == "WHITE", "White",
+                       ifelse(victim_race == "WHITE HISPANIC", "White Hispanic",
+                       ifelse(victim_race == "BLACK", "Black",
+                       ifelse(victim_race == "BLACK HISPANIC", "Black Hispanic",
+                       ifelse(victim_race == "AMERICAN INDIAN/ALASKAN NATIVE", 
+                              "Native",
+                       ifelse(victim_race == "ASIAN / PACIFIC ISLANDER", "Asian", 
+                       ifelse(victim_race == "UNKNOWN", "Unknown", victim_race))))))),
+         victim_race = as.factor(victim_race),
+         victim_age = as.factor(victim_age),
+         perp_age = as.factor(perp_age))
+summary(age_pred_data)
+```
+
+Then we create a model and look at it's metrics.
+
+```{r model}
+age_model <- multinom(perp_age ~ victim_race + victim_age, data = age_pred_data)
+summary(age_model)
+```
+
+Then we visualize the fitted model for the predicted age of shooters based on some of the victim's demographics. Unfortunately I cannot find a way to display all variables in one plot, so I will create two plots and use `grid.arrange` to show them side-by-side.
+
+```{r visualize_model, fig.width = 10, fig.height = 6}
+# Create prediction data.
+plot_data <- as_tibble(expand.grid(perp_age = c("1", "2", "3", "4", "5", 
+                                                "Unknown"),
+                         victim_race = c("Asian", "Black", "Black Hispanic", 
+                                         "Native", "White", "White Hispanic", 
+                                         "Unknown"),
+                         victim_age = c("1", "2", "3", "4", "5", "Unknown")))
+
+pred_data <- plot_data |>
+  bind_cols(predict(age_model, plot_data, type = "class")) 
+
+# Reformatting for easier plotting.
+pred_data <- pred_data |>
+  rename(pred_age = "...4") |>
+  mutate(victim_age = as.character(victim_age),    # Un-factor the variables 
+         pred_age = as.character(pred_age),
+         victim_age = ifelse(victim_age == "1", "<18",
+                      ifelse(victim_age == "2", "18-24",
+                      ifelse(victim_age == "3", "25-44",
+                      ifelse(victim_age == "4", "45-64",
+                      ifelse(victim_age == "5", "65+", victim_age))))),
+         pred_age = ifelse(pred_age == "1", "<18",
+                      ifelse(pred_age == "2", "18-24",
+                      ifelse(pred_age == "3", "25-44",
+                      ifelse(pred_age == "4", "45-64",
+                      ifelse(pred_age == "5", "65+", pred_age))))),
+         victim_age = as.factor(victim_age),   # Re-factor the variables
+         pred_age = as.factor(pred_age))
+
+# Plot for predicted age of shooters including victim_race.
+p_race <- pred_data |> 
+  ggplot(aes(victim_race, fill = pred_age)) +
+  geom_bar(aes(y = after_stat(count)/sum(after_stat(count))), position="dodge") +
+  scale_fill_brewer(palette = "BuPu") +
+  theme_bw() +
+  ggtitle("Predicted Age of Shooters Based on Victim Demographics: Race Shown") +
+  xlab("Victim's Race") +
+  ylab("proportion")
+
+# Plot for predicted age of shooters including victim_age.
+p_age <- pred_data |> 
+  ggplot(aes(victim_age, fill = pred_age)) +
+  geom_bar(aes(y = after_stat(count)/sum(after_stat(count))), position="dodge") +
+  scale_fill_manual(values = c("#F7C8A4FF", "#C1A59DFF", "#979A9BFF",
+                               "#7795A2FF", "#497889FF")) +
+  theme_bw() +
+  ggtitle("Predicted Age of Shooters Based on Victim Demographics: Age Shown") +
+  xlab("Victim's Age") +
+  ylab("proportion")
+
+grid.arrange(p_race, p_age)
+```
+
+The y-axis `proportion` represents the proportion of shootings out of the 300 sample data points used for prediction.
+
+Well, our model predicts that, in any shooting, the shooter will be 18-44 years old, or of unknown age. According to our model, there is no other age that commits shootings. This is quite unrepresentative of our data, as shown here:
+
+```{r model_test1}
+nypd_data |>
+  select(perp_age) |>
+  filter(is.na(perp_age) == FALSE) |>
+  count(perp_age)
+```
+
+This could be indicative of several things, but I do not have the knowledge to dig deeper at this issue. The model will remain as is and we will move on to what conclusions we can draw, however tentative.
+
+##### Conclusions based on age
+
+The model predicts that, if a victim is between ages 25 and 64, or of unknown age, then the shooter is definitely age 25 to 44. Another conclusion we can draw from the model is that the predicted age of shooters seems to loosely mirror that of the victims, forming a range that is centered on the shooter's age. Except in the case of shooters of unknown age.
+
+##### Conclusions based on race
+
+The model predicts that, if a victim is Black, Native American, White or White Hispanic, then they are twice as likely to have been shot by someone ages 25-44 than any other age. The Asian, Black Hispanic, and unknown race victims are equally as likely to have been shot by someone ages 18-24 as someone ages 25-44. Interestingly only the Native American victims are likely to have been shot by someone of unknown age.
+
+
+## Bias
+
+Bias is inevitable when working with data. The main source of bias present in this document is the missing data and how it was handled. In each case, the listwise deletion method was chosen. How does this bias our conclusions?
+
+To determine how much bias is present, we will investigate the original dataset using a heatmap of the variables used for each plot. Note that the comparison between the fatality of a shooting and the victim's age only required a deletion of less than $0.3%$ of the dataset, thus barely influencing the conclusions that can be drawn.
+
+##### Bias in the 'Race-on-Race shootings' figure
+
+Let's determine how much bias is present in the 'Race-on-Race shootings' figure. First we import the original dataset, and do some tidying. Then we visualize how our missing data is represented throughout the dataset.
+
+```{r bias_race_on_race}
+bias_test_data <- read.csv("https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD")
+
+# Tidying
+bias_test_tidy <- bias_test_data |>
+  # This large `mutate` function is simply a relabeling of our categories to 
+  # make our graphs easier to understand later.
+  mutate(VIC_RACE = ifelse(VIC_RACE == "WHITE", "White",
+                       ifelse(VIC_RACE == "WHITE HISPANIC", "White Hispanic",
+                       ifelse(VIC_RACE == "BLACK", "Black",
+                       ifelse(VIC_RACE == "BLACK HISPANIC", "Black Hispanic",
+                       ifelse(VIC_RACE == "AMERICAN INDIAN/ALASKAN NATIVE", 
+                              "Native",
+                       ifelse(VIC_RACE == "ASIAN / PACIFIC ISLANDER", "Asian", 
+                       ifelse(VIC_RACE == "UNKNOWN", "Unknown", VIC_RACE))))))),
+         PERP_RACE = ifelse(PERP_RACE == "WHITE", "White",
+                       ifelse(PERP_RACE == "WHITE HISPANIC", "White Hispanic",
+                       ifelse(PERP_RACE == "BLACK", "Black",
+                       ifelse(PERP_RACE == "BLACK HISPANIC", "Black Hispanic",
+                       ifelse(PERP_RACE == "AMERICAN INDIAN/ALASKAN NATIVE", 
+                              "Native",
+                       ifelse(PERP_RACE == "ASIAN / PACIFIC ISLANDER", "Asian", 
+                       ifelse(PERP_RACE == "UNKNOWN", "Unknown", PERP_RACE)))))))) |>
+  # Unifying the missing data and labeling it "N/A"
+  mutate(PERP_RACE = ifelse(PERP_RACE %in% c("", " ", "(null)"), NA, PERP_RACE),
+         PERP_RACE = ifelse(is.na(PERP_RACE == TRUE), "N/A", PERP_RACE),
+         
+         # This unification is useful for the next bias investigation
+         PERP_AGE_GROUP = ifelse(PERP_AGE_GROUP %in% 
+                                   c("", " ", "(null)", "1020", "1028", "2021",
+                                     "224", "940"), NA, PERP_AGE_GROUP),
+         PERP_AGE_GROUP = ifelse(is.na(PERP_AGE_GROUP)==TRUE, "N/A", PERP_AGE_GROUP),
+         VIC_AGE_GROUP = ifelse(VIC_AGE_GROUP == "1022", NA, VIC_AGE_GROUP),
+         VIC_AGE_GROUP = ifelse(is.na(VIC_AGE_GROUP)==TRUE, "N/A", VIC_AGE_GROUP),
+         
+         # 'Factoring' the data
+         PERP_RACE = as.factor(PERP_RACE),
+         VIC_RACE = as.factor(VIC_RACE),
+         PERP_AGE_GROUP = as.factor(PERP_AGE_GROUP),
+         VIC_AGE_GROUP = as.factor(VIC_AGE_GROUP))
+
+# Reformatting
+bias_test_race_on_race <- bias_test_tidy |>
+  select(PERP_RACE, VIC_RACE) |>
+  group_by(PERP_RACE, VIC_RACE) |>
+  summarize(total = n()) |>
+  ungroup() |>
+  filter(PERP_RACE == "N/A")
+
+# Plotting
+bias_test_race_on_race |>
+  ggplot(aes(x=VIC_RACE, y=PERP_RACE, fill=total)) +
+  geom_tile() +
+  scale_fill_gradient(low="white", high = "red")
+```
+
+There is a severe amount of contrast in this heatmap. This indicates that the missing data is not evenly spread across the variables we looked at. This means the missing data does not satisfy the MCAR (missing completely at random) requirement that is often used when determining the validity of listwise deletion. This indicates that our data, or at least the two variables `PERP_RACE` and `VIC_RACE`, are biased to a strong degree. The conclusions may not be wholly representative of all shootings in NYC. Thus, the conclusions drawn can only be circumstantially useful.
+
+##### Bias in Shooter's age Analysis
+
+Next we will look at the bias present in the 'Shooter's age analysis'. We will start by using the `bias_test_tidy` tibble created in the previous code chunk. 
+
+```{r bias_shooter_age}
+# Reformatting
+bias_test_shooter_age <- bias_test_tidy |>
+  select(PERP_AGE_GROUP, VIC_AGE_GROUP, VIC_RACE) |>
+  group_by(PERP_AGE_GROUP, VIC_AGE_GROUP, VIC_RACE) |>
+  summarize(total = n()) |>
+  ungroup() |>
+  filter(PERP_AGE_GROUP == "N/A")
+
+# Plotting using grid.arrange
+p_bias1 <- bias_test_shooter_age |>
+  ggplot(aes(x=VIC_AGE_GROUP, y=PERP_AGE_GROUP, fill=total)) +
+  geom_tile() +
+  scale_fill_gradient(low="white", high="red")
+
+p_bias2 <- bias_test_shooter_age |>
+  ggplot(aes(x=VIC_RACE, y=PERP_AGE_GROUP, fill=total)) +
+  geom_tile() +
+  scale_fill_gradient(low="white", high="red")
+
+p_bias3 <- bias_test_shooter_age |>
+  ggplot(aes(x=VIC_AGE_GROUP, y=VIC_RACE, fill=total)) +
+  geom_tile() +
+  scale_fill_gradient(low="white", high="red")
+
+grid.arrange(p_bias1, p_bias2, p_bias3)
+```
+
+There is almost zero contrast in the heatmap between `VIC_RACE` and `PERP_AGE_GROUP`, and there is little contrast in the heatmap between `VIC_AGE_GROUP` and `PERP_AGE_GROUP`. However, there is significant contrast on the heatmap between the two predictive variables, `VIC_AGE_GROUP` and `VIC_RACE`. This indicates that the model we created is missing "pieces to the puzzle"; there is significant bias generated by the listwise deletion of missing data when our model was formed. Modelling only enhances any bias present in the data, so it is reasonable to conclude that our model is not capturing the whole picture. This may be why our model predicted that shooters are only between the ages of 18-44 or of unknown age when the dataset as a whole did not suggest that.
+
+## Conclusion
+
+This has been a light investigation and analysis of the "NYPD Shooting Incident Data" dataset. While it is disappointing that no strong conclusions were able to be drawn as a result of strong bias present in the data, this document serves a purpose for learning what can cause bias and how it can manifest in the modeling process. Due to time constraints, I went through the data science analysis process first and only considered potential bias after all conclusions were drawn. Next time, bias mitigation strategies will be in the forefront of my mind as I start the data science process.
+
+
+```{r, echo=FALSE}
+sessionInfo
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r extra_code, include=FALSE, eval=FALSE}
+vic_of_white_hispanic <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="WHITE HISPANIC") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "WHITE HISPANIC")
+
+vic_of_native <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="AMERICAN INDIAN/ALASKAN NATIVE") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "AMERICAN INDIAN/ALASKAN NATIVE")
+
+vic_of_aapi <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="ASIAN / PACIFIC ISLANDER") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "ASIAN / PACIFIC ISLANDER")
+
+vic_of_black <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="BLACK") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "BLACK")
+
+vic_of_black_hispanic <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="BLACK HISPANIC") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "BLACK HISPANIC")
+
+vic_of_white <- nypd_data |>
+  filter(is.na(perp_race)==FALSE, is.na(victim_race)==FALSE,
+         perp_race=="WHITE") |>
+  select(perp_race, victim_race) |>
+  group_by(victim_race) |>
+  tally() |>
+  pivot_wider(names_from = victim_race, values_from = n) |>
+  mutate(perp_race = "WHITE")
+
+nypd_vic_race <- full_join(vic_of_white, vic_of_black, by = join_by("ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC", "perp_race")) |>
+  full_join(vic_of_white_hispanic, by = join_by("ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC", "perp_race", "AMERICAN INDIAN/ALASKAN NATIVE")) |> 
+  full_join(vic_of_aapi, by = join_by("ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC", "perp_race")) |> 
+  full_join(vic_of_black_hispanic, by = join_by("ASIAN / PACIFIC ISLANDER", "BLACK", "BLACK HISPANIC", "WHITE", "WHITE HISPANIC", "perp_race")) |> 
+  full_join(vic_of_native, by = join_by("BLACK","perp_race"))
+```
+
+```{r early_visuals2, include=FALSE, eval=FALSE}
+nypd_data |>
+  filter(is.na(perp_age) == FALSE, is.na(victim_age) == FALSE) |>
+  select(perp_age, victim_age) |> 
+  ggplot(aes(fill=victim_age, x=perp_age)) +
+  geom_bar(position="dodge")
+```
+
+```{r early_visuals3, include=FALSE, eval=FALSE}
+nypd_data |>
+  filter(is.na(perp_age) == FALSE, is.na(victim_age) == FALSE) |>
+  select(perp_age, victim_age) |> 
+  group_by(perp_age, victim_age) |>
+  tally() |>
+  ungroup() |>
+  ggplot(aes(x=perp_age,y=victim_age,size=n)) +
+  geom_point(alpha=0.7) +
+  scale_size(range=c(0.1,40), name="Num. Shootings")
+```
+
+```{r early_visuals3.1, include=FALSE, eval=FALSE}
+nypd_data |>
+  filter(is.na(perp_age) == FALSE, is.na(victim_age) == FALSE) |>
+  select(perp_age, victim_age) |> 
+  group_by(perp_age, victim_age) |>
+  tally() |>
+  ungroup() |>
+  ggplot(aes(x=perp_age,y=victim_age, fill=n)) +
+  geom_tile() +
+  scale_fill_gradient(low="white", high = "red")
+```
+
+```{r early_visuals4, include=FALSE, eval=FALSE}
+nypd_data |>
+  filter(is.na(perp_race) == FALSE, is.na(victim_race) == FALSE) |>
+  select(perp_race, victim_race) |> 
+  ggplot(aes(fill=victim_race, x=perp_race)) +
+  geom_bar(position="dodge")
+```
+
+```{r early_visuals5, include=FALSE, eval=FALSE}
+nypd_data |>
+  filter(perp_race == "BLACK", victim_race == "BLACK") |>
+  select(victim_race, date) |>
+  ggplot(aes(x=date)) +
+  geom_histogram(binwidth=30)
+```
+
+
+```{r early_model_death_by_borough, include=FALSE, eval=FALSE}
+#Switching gears, we will conduct a preliminary analysis into whether the shooting location (Borough) has an effect on the fatality of the shooting. We start by identifying the type of model to use. The variables involved are `borough` and `victim_death`, which are both categorical variables with no natural ordering. This means, a valid model is a multinomial logistic regression. We will use the `multinom` function from the `nnet` package to do so.
+
+nypd_death_borough_data <- nypd_data |>
+  select(borough, victim_death) |>
+  filter(is.na(victim_death)==FALSE)
+
+set.seed(1)  # For reproducibility
+
+model_death_borough <- multinom(victim_death ~ borough, nypd_death_borough_data)
+summary(model_death_borough)
+
+borough <- c("BRONX", "BROOKLYN", "MANHATTAN", "QUEENS", "STATEN ISLAND")
+
+plotdata <- borough |>
+  bind_cols(predict(model_death_borough, borough, type="probs"))
+
+fatality_model <- plotdata |>
+  rename("borough" = ...1, "fatality_model" = ...2) |>
+  mutate(borough = as.factor(borough))
+```
+
+
+```{r early_death_by_borough, include=FALSE, eval=FALSE}
+# Now, let's compare the fatality rates generated by our model to the actual one's gained from the data:
+
+fatality_borough <- nypd_death_borough_data |>
+  group_by(borough) |>
+  summarize(fatality = sum(victim_death)/n())
+
+fatality_by_borough <- inner_join(fatality_model, fatality_borough, by = 'borough') 
+
+fatality_by_borough |>
+  pivot_longer(cols = c('fatality', 'fatality_model'), names_to = 'data_source', values_to = 'fatality') |>
+  ggplot(aes(x=borough, y=fatality, fill=data_source)) +
+  geom_bar(position="dodge", stat = "identity")
+```
+
+```{r, include=FALSE, eval=FALSE}
+#Well, they are identical. This seems to indicate several things: we could have chosen the wrong model, the implementation of the model was poor, or maybe the relation between the variables is too simple to be effectively modeled.
+```
+
